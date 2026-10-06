@@ -113,6 +113,28 @@
       ]
     },
     {
+      "id": "record-measurement-batch",
+      "name": "Record measurement batch",
+      "entry": "POST /cases/{id}/measurements/batch",
+      "steps": [
+        "validate every reading against the waiting case before committing",
+        "append one measurement and one audit event per reading atomically",
+        "store the idempotency key and payload fingerprint with the batch"
+      ],
+      "success": "returns per-reading results located by index and a review_ready or recheck_required case",
+      "failure": "rolls the whole batch back on any invalid reading, reports its index, and replays or rejects key reuse",
+      "verification": "workflowcheck submits valid and mixed batches, locates the invalid row, replays retries, rejects key reuse, and races duplicate submissions",
+      "module_ids": [
+        "runtimecheck",
+        "httpapi",
+        "assurance",
+        "domain",
+        "repository",
+        "contracts",
+        "bootstrap"
+      ]
+    },
+    {
       "id": "reopen-verification-case",
       "name": "Reopen verification case",
       "entry": "POST /cases/{id}/reopen",
@@ -162,8 +184,10 @@
       "state_transition",
       "resource_lifetime",
       "error_propagation",
-      "concurrency"
+      "concurrency",
+      "idempotency",
+      "atomic_batch"
     ],
-    "notes": "Case changes and audit events commit atomically; a mutex-protected repository makes duplicate and concurrent seal attempts deterministic."
+    "notes": "Case changes and audit events commit atomically; a mutex-protected repository makes duplicate and concurrent seal attempts deterministic. Measurement batches are all-or-nothing in the same commit and use a persisted idempotency key so retries replay instead of duplicating facts."
   }
 }

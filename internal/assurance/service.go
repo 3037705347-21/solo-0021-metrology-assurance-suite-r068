@@ -167,12 +167,7 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if err := m.UpdateCase(item); err != nil {
 			return err
 		}
-		kind := "measurement_rejected"
-		detail := "measurement exceeded tolerance and requires another measurement"
-		if measurement.Accepted {
-			kind = "measurement_accepted"
-			detail = "measurement is within tolerance and ready for review"
-		}
+		kind, detail := measurementEventDescription(measurement.Accepted)
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
 			"case",
@@ -301,6 +296,13 @@ func bestAcceptedMeasurement(items []domain.Measurement) (domain.Measurement, bo
 		}
 	}
 	return selected, found
+}
+
+func measurementEventDescription(accepted bool) (kind, detail string) {
+	if accepted {
+		return "measurement_accepted", "measurement is within tolerance and ready for review"
+	}
+	return "measurement_rejected", "measurement exceeded tolerance and requires another measurement"
 }
 
 func caseResponse(m *repository.Mutation, item domain.VerificationCase) contracts.CaseResponse {

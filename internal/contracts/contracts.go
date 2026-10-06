@@ -21,6 +21,11 @@ type RecordMeasurementRequest struct {
 	Technician string  `json:"technician"`
 }
 
+type RecordMeasurementBatchRequest struct {
+	IdempotencyKey string                     `json:"idempotency_key"`
+	Readings       []RecordMeasurementRequest `json:"readings"`
+}
+
 type ReopenCaseRequest struct {
 	Actor  string `json:"actor"`
 	Reason string `json:"reason"`
@@ -42,8 +47,30 @@ type CaseResponse struct {
 	Events       []domain.AuditEvent     `json:"events"`
 }
 
+// MeasurementItemResult is the locatable outcome of one reading inside a
+// batch. Index is the reading's zero-based position in the request.
+type MeasurementItemResult struct {
+	Index       int                `json:"index"`
+	Measurement domain.Measurement `json:"measurement"`
+	EventID     string             `json:"event_id"`
+}
+
+type BatchMeasurementsResponse struct {
+	CaseResponse
+	BatchID        string                  `json:"batch_id"`
+	IdempotencyKey string                  `json:"idempotency_key"`
+	Replayed       bool                    `json:"replayed"`
+	Results        []MeasurementItemResult `json:"results"`
+}
+
 type EventsResponse struct {
 	Events []domain.AuditEvent `json:"events"`
+}
+
+type ItemErrorDetail struct {
+	Index   int    `json:"index"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
 }
 
 type ErrorResponse struct {
@@ -51,6 +78,7 @@ type ErrorResponse struct {
 }
 
 type ErrorBody struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code    string            `json:"code"`
+	Message string            `json:"message"`
+	Details []ItemErrorDetail `json:"details,omitempty"`
 }

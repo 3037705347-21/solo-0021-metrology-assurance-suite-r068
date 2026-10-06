@@ -14,6 +14,7 @@ type Repository struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	batches      map[string]domain.MeasurementBatch
 	events       []domain.AuditEvent
 	counters     map[string]int
 }
@@ -24,6 +25,7 @@ func New() *Repository {
 		cases:        make(map[string]domain.VerificationCase),
 		measurements: make(map[string][]domain.Measurement),
 		seals:        make(map[string]domain.EvidenceSeal),
+		batches:      make(map[string]domain.MeasurementBatch),
 		counters:     make(map[string]int),
 	}
 }
@@ -33,6 +35,7 @@ type Snapshot struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	batches      map[string]domain.MeasurementBatch
 	events       []domain.AuditEvent
 }
 
@@ -95,6 +98,7 @@ type Mutation struct {
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
 	seals        map[string]domain.EvidenceSeal
+	batches      map[string]domain.MeasurementBatch
 	events       []domain.AuditEvent
 	counters     map[string]int
 }
@@ -189,6 +193,24 @@ func (m *Mutation) PutSeal(item domain.EvidenceSeal) error {
 	return nil
 }
 
+func batchKey(caseID, idempotencyKey string) string {
+	return caseID + "\x00" + idempotencyKey
+}
+
+func (m *Mutation) MeasurementBatch(caseID, idempotencyKey string) (domain.MeasurementBatch, bool) {
+	item, ok := m.batches[batchKey(caseID, idempotencyKey)]
+	return item, ok
+}
+
+func (m *Mutation) PutMeasurementBatch(item domain.MeasurementBatch) error {
+	key := batchKey(item.CaseID, item.IdempotencyKey)
+	if _, exists := m.batches[key]; exists {
+		return fmt.Errorf("%w: idempotency key %s for case %s", domain.ErrIdempotencyKeyReuse, item.IdempotencyKey, item.CaseID)
+	}
+	m.batches[key] = item
+	return nil
+}
+
 func (m *Mutation) AppendEvent(item domain.AuditEvent) {
 	m.events = append(m.events, item)
 }
@@ -224,6 +246,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
+		batches:      cloneBatches(r.batches),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 		counters:     cloneCounters(r.counters),
 	}
@@ -234,6 +257,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	r.cases = next.cases
 	r.measurements = next.measurements
 	r.seals = next.seals
+	r.batches = next.batches
 	r.events = next.events
 	r.counters = next.counters
 	return nil
@@ -245,6 +269,7 @@ func (r *Repository) snapshot() Snapshot {
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
 		seals:        cloneSeals(r.seals),
+		batches:      cloneBatches(r.batches),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 	}
 }
@@ -276,6 +301,16 @@ func cloneMeasurements(values map[string][]domain.Measurement) map[string][]doma
 func cloneSeals(values map[string]domain.EvidenceSeal) map[string]domain.EvidenceSeal {
 	result := make(map[string]domain.EvidenceSeal, len(values))
 	for key, value := range values {
+		result[key] = value
+	}
+	return result
+}
+
+func cloneBatches(values map[string]domain.MeasurementBatch) map[string]domain.MeasurementBatch {
+	result := make(map[string]domain.MeasurementBatch, len(values))
+	for key, value := range values {
+		value.MeasurementIDs = append([]string(nil), value.MeasurementIDs...)
+		value.EventIDs = append([]string(nil), value.EventIDs...)
 		result[key] = value
 	}
 	return result

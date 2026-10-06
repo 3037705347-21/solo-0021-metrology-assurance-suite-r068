@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 
+	"example.com/solo-0021-metrology-assurance-suite/internal/assurance"
 	"example.com/solo-0021-metrology-assurance-suite/internal/contracts"
 	"example.com/solo-0021-metrology-assurance-suite/internal/domain"
 )
@@ -38,12 +39,22 @@ func writeError(writer http.ResponseWriter, err error) {
 	if status == http.StatusInternalServerError {
 		message = "unexpected server failure"
 	}
-	writeJSON(writer, status, contracts.ErrorResponse{
-		Error: contracts.ErrorBody{
-			Code:    code,
-			Message: message,
-		},
-	})
+	body := contracts.ErrorBody{
+		Code:    code,
+		Message: message,
+	}
+	var batchItems *assurance.BatchItemsError
+	if errors.As(err, &batchItems) {
+		body.Details = make([]contracts.ItemErrorDetail, len(batchItems.Items))
+		for index, item := range batchItems.Items {
+			body.Details[index] = contracts.ItemErrorDetail{
+				Index:   item.Index,
+				Code:    item.Code,
+				Message: item.Message,
+			}
+		}
+	}
+	writeJSON(writer, status, contracts.ErrorResponse{Error: body})
 }
 
 func errorStatus(err error) (int, string) {
@@ -56,6 +67,8 @@ func errorStatus(err error) (int, string) {
 		return http.StatusConflict, "duplicate_asset_tag"
 	case errors.Is(err, domain.ErrActiveCaseExists):
 		return http.StatusConflict, "active_case_exists"
+	case errors.Is(err, domain.ErrIdempotencyKeyReuse):
+		return http.StatusConflict, "idempotency_key_reuse"
 	case errors.Is(err, domain.ErrSealAlreadyCreated):
 		return http.StatusConflict, "seal_exists"
 	case errors.Is(err, domain.ErrStateConflict):

@@ -70,6 +70,26 @@ func (s *Server) recordMeasurement(writer http.ResponseWriter, request *http.Req
 	writeJSON(writer, http.StatusCreated, view)
 }
 
+func (s *Server) recordMeasurementsBatch(writer http.ResponseWriter, request *http.Request) {
+	input, err := decodeJSON[contracts.RecordMeasurementBatchRequest](writer, request)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	view, replayed, err := s.service.RecordMeasurements(request.Context(), request.PathValue("id"), input)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	// A replayed batch created no new resources, so 200 distinguishes retries
+	// from the original 201 submission.
+	status := http.StatusCreated
+	if replayed {
+		status = http.StatusOK
+	}
+	writeJSON(writer, status, view)
+}
+
 func (s *Server) reopenCase(writer http.ResponseWriter, request *http.Request) {
 	input, err := decodeJSON[contracts.ReopenCaseRequest](writer, request)
 	if err != nil {

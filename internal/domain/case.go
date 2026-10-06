@@ -73,6 +73,34 @@ func (c *VerificationCase) RecordMeasurement(accepted bool, at time.Time) error 
 	if c.State != CaseAwaitingMeasurement {
 		return fmt.Errorf("%w: case is not awaiting measurement", ErrStateConflict)
 	}
+	c.applyMeasurementOutcome(accepted, at)
+	return nil
+}
+
+// RecordMeasurementBatch applies the outcome of a whole measurement batch.
+// Every reading is accepted while the case is awaiting measurement; the case
+// moves to review_ready only when every reading is in tolerance, otherwise it
+// moves to recheck_required. The batch is one case decision, so the version is
+// incremented exactly once even though several readings are recorded.
+func (c *VerificationCase) RecordMeasurementBatch(accepted []bool, at time.Time) error {
+	if len(accepted) == 0 {
+		return fmt.Errorf("%w: at least one measurement is required", ErrInvalidInput)
+	}
+	if c.State != CaseAwaitingMeasurement {
+		return fmt.Errorf("%w: case is not awaiting measurement", ErrStateConflict)
+	}
+	allAccepted := true
+	for _, item := range accepted {
+		if !item {
+			allAccepted = false
+			break
+		}
+	}
+	c.applyMeasurementOutcome(allAccepted, at)
+	return nil
+}
+
+func (c *VerificationCase) applyMeasurementOutcome(accepted bool, at time.Time) {
 	if accepted {
 		c.State = CaseReviewReady
 	} else {
@@ -80,7 +108,6 @@ func (c *VerificationCase) RecordMeasurement(accepted bool, at time.Time) error 
 	}
 	c.Version++
 	c.UpdatedAt = at.UTC()
-	return nil
 }
 
 func (c *VerificationCase) Reopen(at time.Time) error {

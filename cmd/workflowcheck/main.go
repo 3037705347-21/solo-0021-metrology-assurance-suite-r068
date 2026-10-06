@@ -38,6 +38,7 @@ func main() {
 		"register-device":          checkRegisterDevice,
 		"open-verification-case":   checkOpenVerificationCase,
 		"record-measurement":       checkRecordMeasurement,
+		"record-measurement-batch": checkRecordMeasurementBatch,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
 	}
@@ -240,6 +241,359 @@ func checkRecordMeasurement() error {
 	}
 	if rejectedValue {
 		return errors.New("out-of-tolerance measurement was accepted")
+	}
+	return nil
+}
+
+func checkRecordMeasurementBatch() error {
+	h := newHarness()
+	defer h.close()
+
+	// 1. Happy path: three in-tolerance readings land as one batch and each
+	// result is locatable by request index.
+	caseID, err := h.openAwaitingCase("MET-1501")
+	if err != nil {
+		return err
+	}
+	readings := []map[string]any{
+		batchReading(25.1, "Rui"),
+		batchReading(25.2, "Rui"),
+		batchReading(24.8, "Lin"),
+	}
+	first, err := h.recordMeasurementBatch(caseID, "batch-1", readings)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(first, http.StatusCreated); err != nil {
+		return err
+	}
+	state, err := nestedString(first.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != "review_ready" {
+		return fmt.Errorf("all-accepted batch state = %q, want review_ready", state)
+	}
+	replayed, err := nestedBool(first.Body, "replayed")
+	if err != nil {
+		return err
+	}
+	if replayed {
+		return errors.New("original submission was marked as replayed")
+	}
+	results, err := nestedSlice(first.Body, "results")
+	if err != nil {
+		return err
+	}
+	if len(results) != 3 {
+		return fmt.Errorf("results length = %d, want 3", len(results))
+	}
+	for index, value := range []float64{25.1, 25.2, 24.8} {
+		resultIndex, err := nestedInt(first.Body, "results", index, "index")
+		if err != nil {
+			return err
+		}
+		if resultIndex != index {
+			return fmt.Errorf("result %d reported index %d", index, resultIndex)
+		}
+		observed, err := nestedFloat(first.Body, "results", index, "measurement", "observed")
+		if err != nil {
+			return err
+		}
+		if observed != value {
+			return fmt.Errorf("result %d observed = %v, want %v", index, observed, value)
+		}
+		eventID, err := nestedStringAny(first.Body, "results", index, "event_id")
+		if err != nil {
+			return err
+		}
+		if eventID == "" {
+			return fmt.Errorf("result %d has no event id", index)
+		}
+	}
+	measurements, err := nestedSlice(first.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(measurements) != 3 {
+		return fmt.Errorf("measurements length = %d, want 3", len(measurements))
+	}
+	events, err := nestedSlice(first.Body, "events")
+	if err != nil {
+		return err
+	}
+	// One case_opened event plus one measurement event per reading.
+	if len(events) != 4 {
+		return fmt.Errorf("audit events length = %d, want 4 (one per reading plus case_opened)", len(events))
+	}
+	if count := countEventsByKind(first.Body, "measurement_accepted"); count != 3 {
+		return fmt.Errorf("measurement_accepted events = %d, want 3", count)
+	}
+	version, err := nestedInt(first.Body, "case", "version")
+	if err != nil {
+		return err
+	}
+	if version != 2 {
+		return fmt.Errorf("case version = %d, want 2 after one batch decision", version)
+	}
+
+	// 2. Retry with the same key and payload replays the original facts (200,
+	// replayed=true, same ids) even though the case is now review_ready.
+	retry, err := h.recordMeasurementBatch(caseID, "batch-1", readings)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(retry, http.StatusOK); err != nil {
+		return err
+	}
+	flag, err := nestedBool(retry.Body, "replayed")
+	if err != nil {
+		return err
+	}
+	if !flag {
+		return errors.New("retried batch was not marked as replayed")
+	}
+	retryResults, err := nestedSlice(retry.Body, "results")
+	if err != nil {
+		return err
+	}
+	if len(retryResults) != 3 {
+		return fmt.Errorf("replayed results length = %d, want 3", len(retryResults))
+	}
+	for index := range readings {
+		replayedID, err := nestedStringAny(retry.Body, "results", index, "measurement", "id")
+		if err != nil {
+			return err
+		}
+		originalID, err := nestedStringAny(first.Body, "results", index, "measurement", "id")
+		if err != nil {
+			return err
+		}
+		if replayedID != originalID {
+			return fmt.Errorf("replay at %d created new measurement %s, want %s", index, replayedID, originalID)
+		}
+	}
+	read, err := h.request(http.MethodGet, "/cases/"+caseID, nil)
+	if err != nil {
+		return err
+	}
+	persisted, err := nestedSlice(read.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(persisted) != 3 {
+		return fmt.Errorf("retry duplicated measurements: %d entries", len(persisted))
+	}
+	persistedEvents, err := nestedSlice(read.Body, "events")
+	if err != nil {
+		return err
+	}
+	if len(persistedEvents) != 4 {
+		return fmt.Errorf("retry duplicated audit events: %d entries", len(persistedEvents))
+	}
+
+	// 3. Same key with a different payload is rejected as a conflict and
+	// changes nothing.
+	tampered, err := h.recordMeasurementBatch(caseID, "batch-1", []map[string]any{batchReading(25.3, "Rui")})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(tampered, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(tampered, "idempotency_key_reuse"); err != nil {
+		return err
+	}
+
+	// 4. A new batch against the now review_ready case fails state validation
+	// without writing anything.
+	stateBatch, err := h.recordMeasurementBatch(caseID, "batch-2", []map[string]any{batchReading(25.1, "Rui")})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(stateBatch, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(stateBatch, "state_conflict"); err != nil {
+		return err
+	}
+
+	// 5. An invalid row (blank technician) rejects the whole batch and points
+	// at the offending index; no half-batch survives.
+	mixedCaseID, err := h.openAwaitingCase("MET-1502")
+	if err != nil {
+		return err
+	}
+	invalid, err := h.recordMeasurementBatch(mixedCaseID, "batch-bad", []map[string]any{
+		batchReading(25.1, "Rui"),
+		batchReading(25.0, "   "),
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(invalid, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(invalid, "invalid_input"); err != nil {
+		return err
+	}
+	details, err := nestedSlice(invalid.Body, "error", "details")
+	if err != nil {
+		return err
+	}
+	if len(details) != 1 {
+		return fmt.Errorf("invalid batch reported %d details, want 1", len(details))
+	}
+	detailIndex, err := nestedInt(invalid.Body, "error", "details", 0, "index")
+	if err != nil {
+		return err
+	}
+	if detailIndex != 1 {
+		return fmt.Errorf("invalid detail index = %d, want 1", detailIndex)
+	}
+	detailCode, err := nestedStringAny(invalid.Body, "error", "details", 0, "code")
+	if err != nil {
+		return err
+	}
+	if detailCode != "invalid_input" {
+		return fmt.Errorf("invalid detail code = %q", detailCode)
+	}
+	mixedRead, err := h.request(http.MethodGet, "/cases/"+mixedCaseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(mixedRead, http.StatusOK); err != nil {
+		return err
+	}
+	mixedState, err := nestedString(mixedRead.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if mixedState != "awaiting_measurement" {
+		return fmt.Errorf("failed batch moved case to %q", mixedState)
+	}
+	mixedMeasurements, err := nestedSlice(mixedRead.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(mixedMeasurements) != 0 {
+		return fmt.Errorf("failed batch left %d measurements behind", len(mixedMeasurements))
+	}
+	mixedEvents, err := nestedSlice(mixedRead.Body, "events")
+	if err != nil {
+		return err
+	}
+	// The failed batch leaves only the original case_opened event; no
+	// measurement event may survive the rollback.
+	if len(mixedEvents) != 1 {
+		return fmt.Errorf("failed batch left %d audit events behind, want 1", len(mixedEvents))
+	}
+	if count := countEventsByKind(mixedRead.Body, "measurement_accepted"); count != 0 {
+		return fmt.Errorf("failed batch left %d accepted events", count)
+	}
+	if count := countEventsByKind(mixedRead.Body, "measurement_rejected"); count != 0 {
+		return fmt.Errorf("failed batch left %d rejected events", count)
+	}
+
+	// 6. After the failed batch, a corrected batch succeeds and one
+	// out-of-tolerance reading drives the case to recheck_required.
+	corrected, err := h.recordMeasurementBatch(mixedCaseID, "batch-good", []map[string]any{
+		batchReading(25.1, "Rui"),
+		batchReading(26.0, "Rui"),
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(corrected, http.StatusCreated); err != nil {
+		return err
+	}
+	correctedState, err := nestedString(corrected.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if correctedState != "recheck_required" {
+		return fmt.Errorf("mixed-tolerance batch state = %q, want recheck_required", correctedState)
+	}
+	if count := countEventsByKind(corrected.Body, "measurement_accepted"); count != 1 {
+		return fmt.Errorf("corrected batch accepted events = %d, want 1", count)
+	}
+	if count := countEventsByKind(corrected.Body, "measurement_rejected"); count != 1 {
+		return fmt.Errorf("corrected batch rejected events = %d, want 1", count)
+	}
+
+	// 7. Missing idempotency key is rejected before any work happens.
+	missingKey, err := h.request(http.MethodPost, "/cases/"+mixedCaseID+"/measurements/batch", map[string]any{
+		"readings": []map[string]any{batchReading(25.1, "Rui")},
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(missingKey, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(missingKey, "invalid_input"); err != nil {
+		return err
+	}
+
+	// 8. Batch against a missing case is a 404.
+	missingCase, err := h.recordMeasurementBatch("case-9999", "batch-x", []map[string]any{batchReading(25.1, "Rui")})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(missingCase, http.StatusNotFound); err != nil {
+		return err
+	}
+
+	// 9. Concurrent retries of one batch must commit exactly once.
+	concurrentCaseID, err := h.openAwaitingCase("MET-1503")
+	if err != nil {
+		return err
+	}
+	concurrentReadings := []map[string]any{batchReading(25.1, "Rui"), batchReading(25.2, "Lin")}
+	type outcome struct {
+		response apiResponse
+		err      error
+	}
+	outcomes := make(chan outcome, 2)
+	var wait sync.WaitGroup
+	for index := 0; index < 2; index++ {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			response, err := h.recordMeasurementBatch(concurrentCaseID, "concurrent-batch", concurrentReadings)
+			outcomes <- outcome{response: response, err: err}
+		}()
+	}
+	wait.Wait()
+	close(outcomes)
+	created := 0
+	replayedCount := 0
+	for item := range outcomes {
+		if item.err != nil {
+			return item.err
+		}
+		switch item.response.Status {
+		case http.StatusCreated:
+			created++
+		case http.StatusOK:
+			replayedCount++
+		default:
+			return fmt.Errorf("unexpected concurrent batch status %d: %s", item.response.Status, item.response.Raw)
+		}
+	}
+	if created != 1 || replayedCount != 1 {
+		return fmt.Errorf("concurrent batch outcomes: %d created, %d replayed", created, replayedCount)
+	}
+	concurrentRead, err := h.request(http.MethodGet, "/cases/"+concurrentCaseID, nil)
+	if err != nil {
+		return err
+	}
+	concurrentMeasurements, err := nestedSlice(concurrentRead.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(concurrentMeasurements) != 2 {
+		return fmt.Errorf("concurrent batch left %d measurements, want 2", len(concurrentMeasurements))
 	}
 	return nil
 }
@@ -463,6 +817,32 @@ func (h *harness) recordMeasurement(caseID string, observed float64, technician 
 	})
 }
 
+func batchReading(observed float64, technician string) map[string]any {
+	return map[string]any{
+		"observed":   observed,
+		"technician": technician,
+	}
+}
+
+func (h *harness) recordMeasurementBatch(caseID, idempotencyKey string, readings []map[string]any) (apiResponse, error) {
+	return h.request(http.MethodPost, "/cases/"+caseID+"/measurements/batch", map[string]any{
+		"idempotency_key": idempotencyKey,
+		"readings":        readings,
+	})
+}
+
+func (h *harness) openAwaitingCase(tag string) (string, error) {
+	deviceID, err := h.createDevice(tag)
+	if err != nil {
+		return "", err
+	}
+	opened, err := h.openCase(deviceID)
+	if err != nil {
+		return "", err
+	}
+	return nestedString(opened.Body, "case", "id")
+}
+
 func (h *harness) rejectedCase(tag string) (string, error) {
 	deviceID, err := h.createDevice(tag)
 	if err != nil {
@@ -551,33 +931,78 @@ func nestedBool(root map[string]any, path ...any) (bool, error) {
 	return flag, nil
 }
 
-func nestedSlice(root map[string]any, key string) ([]any, error) {
-	value, ok := root[key]
+func nestedInt(root map[string]any, path ...any) (int, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return 0, err
+	}
+	number, ok := value.(float64)
 	if !ok {
-		return nil, fmt.Errorf("missing %s", key)
+		return 0, fmt.Errorf("%v is not a number", path)
+	}
+	return int(number), nil
+}
+
+func nestedFloat(root map[string]any, path ...any) (float64, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return 0, err
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("%v is not a number", path)
+	}
+	return number, nil
+}
+
+func nestedSlice(root map[string]any, path ...any) ([]any, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return nil, err
+	}
+	// A nil slice serializes to JSON null, which means an empty collection.
+	if value == nil {
+		return nil, nil
 	}
 	items, ok := value.([]any)
 	if !ok {
-		return nil, fmt.Errorf("%s is not an array", key)
+		return nil, fmt.Errorf("%v is not an array", path)
 	}
 	return items, nil
 }
 
+func nestedStringAny(root map[string]any, path ...any) (string, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return "", err
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%v is not a string", path)
+	}
+	return text, nil
+}
+
 func hasEvent(root map[string]any, kind string) bool {
+	return countEventsByKind(root, kind) > 0
+}
+
+func countEventsByKind(root map[string]any, kind string) int {
 	items, err := nestedSlice(root, "events")
 	if err != nil {
-		return false
+		return 0
 	}
+	count := 0
 	for _, item := range items {
 		event, ok := item.(map[string]any)
 		if !ok {
 			continue
 		}
 		if event["kind"] == kind {
-			return true
+			count++
 		}
 	}
-	return false
+	return count
 }
 
 func nestedValue(root map[string]any, path ...string) (any, error) {
