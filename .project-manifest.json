@@ -113,6 +113,28 @@
       ]
     },
     {
+      "id": "record-measurement-batch",
+      "name": "Record measurement batch",
+      "entry": "POST /cases/{id}/measurements/batch",
+      "steps": [
+        "replay the stored result when the case-scoped batch_id was already committed",
+        "validate every reading and compute every measurement fact before writing",
+        "commit all measurements, the single case transition, per-reading events, the batch event, and the batch record in one atomic mutation"
+      ],
+      "success": "returns per-reading results located by index and client_ref and a review_ready or recheck_required case",
+      "failure": "one illegal or inapplicable reading rejects the whole batch without partial case, measurement, or audit state",
+      "verification": "workflowcheck verifies the successful batch, rollback, replay, and divergent key; the Go test suite adds concurrency and parity tests",
+      "module_ids": [
+        "runtimecheck",
+        "httpapi",
+        "assurance",
+        "domain",
+        "repository",
+        "contracts",
+        "bootstrap"
+      ]
+    },
+    {
       "id": "reopen-verification-case",
       "name": "Reopen verification case",
       "entry": "POST /cases/{id}/reopen",
@@ -162,8 +184,10 @@
       "state_transition",
       "resource_lifetime",
       "error_propagation",
-      "concurrency"
+      "concurrency",
+      "batch_mutations",
+      "idempotent_replay"
     ],
-    "notes": "Case changes and audit events commit atomically; a mutex-protected repository makes duplicate and concurrent seal attempts deterministic."
+    "notes": "Case changes and audit events commit atomically; a mutex-protected repository makes duplicate and concurrent seal attempts deterministic. Measurement batches are validate-all-then-commit with a case-scoped batch id that replays the stored result so retries never duplicate measurements."
   }
 }

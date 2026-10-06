@@ -38,6 +38,7 @@ func main() {
 		"register-device":          checkRegisterDevice,
 		"open-verification-case":   checkOpenVerificationCase,
 		"record-measurement":       checkRecordMeasurement,
+		"record-measurement-batch": checkRecordMeasurementBatch,
 		"reopen-verification-case": checkReopenVerificationCase,
 		"seal-verification":        checkSealVerification,
 	}
@@ -240,6 +241,258 @@ func checkRecordMeasurement() error {
 	}
 	if rejectedValue {
 		return errors.New("out-of-tolerance measurement was accepted")
+	}
+	return nil
+}
+
+func checkRecordMeasurementBatch() error {
+	h := newHarness()
+	defer h.close()
+
+	deviceID, err := h.createDevice("MET-1211")
+	if err != nil {
+		return err
+	}
+	opened, err := h.openCase(deviceID)
+	if err != nil {
+		return err
+	}
+	caseID, err := nestedString(opened.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+
+	// An all-in-tolerance batch commits every reading and moves the case to
+	// review_ready in one transaction, with per-reading results located by
+	// index or client_ref.
+	batch, err := h.request(http.MethodPost, "/cases/"+caseID+"/measurements/batch", map[string]any{
+		"batch_id": "batch-A",
+		"readings": []map[string]any{
+			{"observed": 25.1, "technician": "Rui", "client_ref": "point-1"},
+			{"observed": 24.7, "technician": "Rui"},
+			{"observed": 25.0, "technician": " Lin ", "client_ref": "point-3"},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(batch, http.StatusCreated); err != nil {
+		return err
+	}
+	state, err := nestedString(batch.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if state != "review_ready" {
+		return fmt.Errorf("accepted batch state = %q", state)
+	}
+	results, err := nestedSlice(batch.Body, "results")
+	if err != nil {
+		return err
+	}
+	if len(results) != 3 {
+		return fmt.Errorf("batch returned %d results, expected 3", len(results))
+	}
+	for index := 0; index < 3; index++ {
+		accepted, err := nestedBool(batch.Body, "results", index, "measurement", "accepted")
+		if err != nil {
+			return err
+		}
+		if !accepted {
+			return fmt.Errorf("result %d was not accepted in an in-tolerance batch", index)
+		}
+		gotIndex, err := nestedInt(batch.Body, "results", index, "index")
+		if err != nil {
+			return err
+		}
+		if gotIndex != index {
+			return fmt.Errorf("result %d reports index %d", index, gotIndex)
+		}
+	}
+	firstRef, err := nestedStringAny(batch.Body, "results", 0, "client_ref")
+	if err != nil {
+		return err
+	}
+	if firstRef != "point-1" {
+		return fmt.Errorf("result client_ref = %q", firstRef)
+	}
+	firstID, err := nestedStringAny(batch.Body, "results", 0, "measurement", "id")
+	if err != nil {
+		return err
+	}
+	measurements, err := nestedSlice(batch.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(measurements) != 3 {
+		return fmt.Errorf("batch committed %d measurements, expected 3", len(measurements))
+	}
+
+	// Replaying the same batch returns the stored results without creating a
+	// second set of measurements.
+	replay, err := h.request(http.MethodPost, "/cases/"+caseID+"/measurements/batch", map[string]any{
+		"batch_id": "batch-A",
+		"readings": []map[string]any{
+			{"observed": 25.1, "technician": "Rui", "client_ref": "point-1"},
+			{"observed": 24.7, "technician": "Rui"},
+			{"observed": 25.0, "technician": "Lin", "client_ref": "point-3"},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(replay, http.StatusOK); err != nil {
+		return err
+	}
+	replayedFlag, err := nestedBool(replay.Body, "replayed")
+	if err != nil {
+		return err
+	}
+	if !replayedFlag {
+		return errors.New("replayed batch did not report replayed=true")
+	}
+	replayFirstID, err := nestedStringAny(replay.Body, "results", 0, "measurement", "id")
+	if err != nil {
+		return err
+	}
+	if replayFirstID != firstID {
+		return fmt.Errorf("replay minted new measurement %s, expected stored %s", replayFirstID, firstID)
+	}
+	replayMeasurements, err := nestedSlice(replay.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(replayMeasurements) != 3 {
+		return fmt.Errorf("replay created duplicate measurements: %d stored", len(replayMeasurements))
+	}
+
+	// Reusing the idempotency key with different readings is a conflict.
+	diverged, err := h.request(http.MethodPost, "/cases/"+caseID+"/measurements/batch", map[string]any{
+		"batch_id": "batch-A",
+		"readings": []map[string]any{
+			{"observed": 25.9, "technician": "Rui"},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(diverged, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(diverged, "batch_already_submitted"); err != nil {
+		return err
+	}
+
+	// Once the first batch moved the case out of the awaiting state, a new
+	// batch cannot create measurements.
+	newBatch, err := h.request(http.MethodPost, "/cases/"+caseID+"/measurements/batch", map[string]any{
+		"batch_id": "batch-B",
+		"readings": []map[string]any{
+			{"observed": 25.1, "technician": "Rui"},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(newBatch, http.StatusConflict); err != nil {
+		return err
+	}
+	if err := expectErrorCode(newBatch, "state_conflict"); err != nil {
+		return err
+	}
+
+	// One illegal reading rejects the whole batch and leaves no half-committed
+	// measurements, audit facts, or case transition.
+	rejectDeviceID, err := h.createDevice("MET-1212")
+	if err != nil {
+		return err
+	}
+	rejectCase, err := h.openCase(rejectDeviceID)
+	if err != nil {
+		return err
+	}
+	rejectCaseID, err := nestedString(rejectCase.Body, "case", "id")
+	if err != nil {
+		return err
+	}
+	invalid, err := h.request(http.MethodPost, "/cases/"+rejectCaseID+"/measurements/batch", map[string]any{
+		"batch_id": "batch-bad",
+		"readings": []map[string]any{
+			{"observed": 25.1, "technician": "Rui"},
+			{"observed": 25.2, "technician": ""},
+			{"observed": 25.3, "technician": "Rui"},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(invalid, http.StatusBadRequest); err != nil {
+		return err
+	}
+	if err := expectErrorCode(invalid, "invalid_input"); err != nil {
+		return err
+	}
+	if !strings.Contains(invalid.Raw, "index 1") {
+		return fmt.Errorf("invalid batch error does not locate the reading: %s", invalid.Raw)
+	}
+	readAfter, err := h.request(http.MethodGet, "/cases/"+rejectCaseID, nil)
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(readAfter, http.StatusOK); err != nil {
+		return err
+	}
+	afterState, err := nestedString(readAfter.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if afterState != "awaiting_measurement" {
+		return fmt.Errorf("failed batch left case in state %q", afterState)
+	}
+	afterMeasurements, err := nestedSlice(readAfter.Body, "measurements")
+	if err != nil {
+		return err
+	}
+	if len(afterMeasurements) != 0 {
+		return fmt.Errorf("failed batch left %d measurements", len(afterMeasurements))
+	}
+	afterEvents, err := nestedSlice(readAfter.Body, "events")
+	if err != nil {
+		return err
+	}
+	if len(afterEvents) != 1 {
+		return fmt.Errorf("failed batch left %d audit events, expected only case_opened", len(afterEvents))
+	}
+
+	// After the failed batch the same idempotency key can be retried with a
+	// corrected payload; the mixed outcome moves the case to recheck_required
+	// while every reading stays individually locatable and accepted/rejected.
+	retry, err := h.request(http.MethodPost, "/cases/"+rejectCaseID+"/measurements/batch", map[string]any{
+		"batch_id": "batch-bad",
+		"readings": []map[string]any{
+			{"observed": 25.1, "technician": "Rui", "client_ref": "ok"},
+			{"observed": 26.4, "technician": "Rui", "client_ref": "out"},
+		},
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(retry, http.StatusCreated); err != nil {
+		return err
+	}
+	mixedState, err := nestedString(retry.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if mixedState != "recheck_required" {
+		return fmt.Errorf("mixed batch state = %q", mixedState)
+	}
+	secondAccepted, err := nestedBool(retry.Body, "results", 1, "measurement", "accepted")
+	if err != nil {
+		return err
+	}
+	if secondAccepted {
+		return errors.New("out-of-tolerance reading was reported accepted")
 	}
 	return nil
 }
@@ -539,6 +792,18 @@ func nestedString(root map[string]any, path ...string) (string, error) {
 	return text, nil
 }
 
+func nestedStringAny(root map[string]any, path ...any) (string, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return "", err
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", fmt.Errorf("%v is not a string", path)
+	}
+	return text, nil
+}
+
 func nestedBool(root map[string]any, path ...any) (bool, error) {
 	value, err := nestedAny(root, path...)
 	if err != nil {
@@ -549,6 +814,18 @@ func nestedBool(root map[string]any, path ...any) (bool, error) {
 		return false, fmt.Errorf("%v is not a boolean", path)
 	}
 	return flag, nil
+}
+
+func nestedInt(root map[string]any, path ...any) (int, error) {
+	value, err := nestedAny(root, path...)
+	if err != nil {
+		return 0, err
+	}
+	number, ok := value.(float64)
+	if !ok {
+		return 0, fmt.Errorf("%v is not a number", path)
+	}
+	return int(number), nil
 }
 
 func nestedSlice(root map[string]any, key string) ([]any, error) {

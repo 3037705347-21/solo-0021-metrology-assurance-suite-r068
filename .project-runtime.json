@@ -5,7 +5,8 @@
     ".go"
   ],
   "build_command": "go build ./...",
-  "testing": "deferred",
+  "testing": "go_test",
+  "test_command": "go test ./... -race",
   "service": {
     "run_command": "go run ./cmd/metrology-service --addr 127.0.0.1:18121",
     "health_url": "http://127.0.0.1:18121/healthz"
@@ -22,6 +23,10 @@
     {
       "workflow_id": "record-measurement",
       "command": "go run ./cmd/workflowcheck --workflow record-measurement"
+    },
+    {
+      "workflow_id": "record-measurement-batch",
+      "command": "go run ./cmd/workflowcheck --workflow record-measurement-batch"
     },
     {
       "workflow_id": "reopen-verification-case",

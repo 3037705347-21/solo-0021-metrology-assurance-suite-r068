@@ -83,6 +83,36 @@ func (c *VerificationCase) RecordMeasurement(accepted bool, at time.Time) error 
 	return nil
 }
 
+// RecordMeasurementBatch applies one atomic batch of readings to a waiting
+// case. The case is eligible only once, before any reading is applied, so a
+// batch can never drive the case through two transitions. Every reading stays
+// an individually accepted/rejected measurement fact; the case becomes
+// review_ready only when every reading is within tolerance, otherwise it
+// requires another measurement. The version advances exactly once.
+func (c *VerificationCase) RecordMeasurementBatch(accepted []bool, at time.Time) error {
+	if c.State != CaseAwaitingMeasurement {
+		return fmt.Errorf("%w: case is not awaiting measurement", ErrStateConflict)
+	}
+	if len(accepted) == 0 {
+		return fmt.Errorf("%w: a measurement batch requires at least one reading", ErrInvalidInput)
+	}
+	allAccepted := true
+	for _, item := range accepted {
+		if !item {
+			allAccepted = false
+			break
+		}
+	}
+	if allAccepted {
+		c.State = CaseReviewReady
+	} else {
+		c.State = CaseRecheckRequired
+	}
+	c.Version++
+	c.UpdatedAt = at.UTC()
+	return nil
+}
+
 func (c *VerificationCase) Reopen(at time.Time) error {
 	if c.State != CaseRecheckRequired {
 		return fmt.Errorf("%w: only a recheck_required case can be reopened", ErrStateConflict)

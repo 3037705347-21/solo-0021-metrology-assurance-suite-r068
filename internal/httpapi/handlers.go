@@ -70,6 +70,26 @@ func (s *Server) recordMeasurement(writer http.ResponseWriter, request *http.Req
 	writeJSON(writer, http.StatusCreated, view)
 }
 
+func (s *Server) recordMeasurementBatch(writer http.ResponseWriter, request *http.Request) {
+	input, err := decodeJSON[contracts.RecordMeasurementBatchRequest](writer, request)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	view, err := s.service.RecordMeasurementBatch(request.Context(), request.PathValue("id"), input)
+	if err != nil {
+		writeError(writer, err)
+		return
+	}
+	// A replayed idempotency key is a replay of the original successful
+	// commit, so it answers 200 rather than claiming a new resource.
+	status := http.StatusCreated
+	if view.Replayed {
+		status = http.StatusOK
+	}
+	writeJSON(writer, status, view)
+}
+
 func (s *Server) reopenCase(writer http.ResponseWriter, request *http.Request) {
 	input, err := decodeJSON[contracts.ReopenCaseRequest](writer, request)
 	if err != nil {

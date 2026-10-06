@@ -146,6 +146,7 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
+		stamp := s.now()
 		measurement, err := domain.NewMeasurement(
 			m.NextID("measurement"),
 			item.ID,
@@ -153,12 +154,12 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 			item.Nominal,
 			item.Tolerance,
 			input.Technician,
-			s.now(),
+			stamp,
 		)
 		if err != nil {
 			return err
 		}
-		if err := item.RecordMeasurement(measurement.Accepted, s.now()); err != nil {
+		if err := item.RecordMeasurement(measurement.Accepted, stamp); err != nil {
 			return err
 		}
 		if err := m.AppendMeasurement(measurement); err != nil {
@@ -167,22 +168,7 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if err := m.UpdateCase(item); err != nil {
 			return err
 		}
-		kind := "measurement_rejected"
-		detail := "measurement exceeded tolerance and requires another measurement"
-		if measurement.Accepted {
-			kind = "measurement_accepted"
-			detail = "measurement is within tolerance and ready for review"
-		}
-		event, err := domain.NewAuditEvent(
-			m.NextID("event"),
-			"case",
-			item.ID,
-			item.ID,
-			kind,
-			measurement.Technician,
-			detail,
-			s.now(),
-		)
+		event, err := measurementEvent(m.NextID("event"), item.ID, measurement, stamp)
 		if err != nil {
 			return err
 		}
@@ -191,6 +177,219 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		return nil
 	})
 	return result, err
+}
+
+// RecordMeasurementBatch commits every reading of a case-scoped batch in one
+// repository mutation: all readings are validated against the current case
+// state before anything is written, so a single invalid or inapplicable
+// reading rejects the whole request without leaving measurements, case state,
+// or audit events half committed. BatchID is an idempotency key scoped to the
+// case; replaying a stored batch returns the original per-reading results
+// instead of creating duplicates.
+func (s *Service) RecordMeasurementBatch(ctx context.Context, caseID string, input contracts.RecordMeasurementBatchRequest) (contracts.BatchMeasurementsResponse, error) {
+	var result contracts.BatchMeasurementsResponse
+	err := s.repository.Mutate(ctx, func(m *repository.Mutation) error {
+		id := strings.TrimSpace(caseID)
+		item, exists := m.Case(id)
+		if !exists {
+			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
+		}
+		batchID := domain.NormalizeBatchID(input.BatchID)
+		if batchID == "" {
+			return fmt.Errorf("%w: batch_id is required", domain.ErrInvalidInput)
+		}
+		readings, err := normalizeReadings(input.Readings)
+		if err != nil {
+			return err
+		}
+		if stored, exists := m.MeasurementBatch(item.ID, batchID); exists {
+			if !sameBatchPayload(readings, stored.Readings) {
+				return fmt.Errorf("%w: batch %s was already submitted to case %s with different readings", domain.ErrBatchReplayed, batchID, item.ID)
+			}
+			result = batchResponse(stored, true)
+			return nil
+		}
+		if item.State != domain.CaseAwaitingMeasurement {
+			return fmt.Errorf("%w: case is not awaiting measurement", domain.ErrStateConflict)
+		}
+
+		stamp := s.now()
+		measurements := make([]domain.Measurement, len(readings))
+		accepted := make([]bool, len(readings))
+		for index, reading := range readings {
+			measurement, err := domain.NewMeasurement(
+				m.NextID("measurement"),
+				item.ID,
+				reading.Observed,
+				item.Nominal,
+				item.Tolerance,
+				reading.Technician,
+				stamp,
+			)
+			if err != nil {
+				return readingInputError(index, reading.Ref, err)
+			}
+			measurements[index] = measurement
+			accepted[index] = measurement.Accepted
+		}
+
+		if err := item.RecordMeasurementBatch(accepted, stamp); err != nil {
+			return err
+		}
+		for _, measurement := range measurements {
+			if err := m.AppendMeasurement(measurement); err != nil {
+				return err
+			}
+		}
+		if err := m.UpdateCase(item); err != nil {
+			return err
+		}
+		for _, measurement := range measurements {
+			event, err := measurementEvent(m.NextID("event"), item.ID, measurement, stamp)
+			if err != nil {
+				return err
+			}
+			m.AppendEvent(event)
+		}
+		batchEvent, err := domain.NewAuditEvent(
+			m.NextID("event"),
+			"case",
+			item.ID,
+			item.ID,
+			"measurement_batch_recorded",
+			readings[0].Technician,
+			fmt.Sprintf("measurement batch %s recorded %d readings; case is now %s", batchID, len(readings), item.State),
+			stamp,
+		)
+		if err != nil {
+			return err
+		}
+		m.AppendEvent(batchEvent)
+
+		measurementIDs := make([]string, len(measurements))
+		for index, measurement := range measurements {
+			measurementIDs[index] = measurement.ID
+		}
+		view := domain.BatchRecordView{
+			Case:         item,
+			Measurements: m.Measurements(item.ID),
+			Events:       m.Events(item.ID),
+		}
+		record, err := domain.NewMeasurementBatchRecord(batchID, item.ID, readings, measurementIDs, view, stamp)
+		if err != nil {
+			return err
+		}
+		if err := m.PutMeasurementBatch(record); err != nil {
+			return err
+		}
+		result = batchResponse(record, false)
+		return nil
+	})
+	return result, err
+}
+
+func normalizeReadings(input []contracts.MeasurementReadingInput) ([]domain.BatchReading, error) {
+	if len(input) < 1 || len(input) > domain.MaxBatchReadings {
+		return nil, fmt.Errorf("%w: a batch must contain between 1 and %d readings", domain.ErrInvalidInput, domain.MaxBatchReadings)
+	}
+	readings := make([]domain.BatchReading, len(input))
+	refs := make(map[string]int, len(input))
+	for index, raw := range input {
+		reading := domain.BatchReading{
+			Observed:   raw.Observed,
+			Technician: strings.TrimSpace(raw.Technician),
+			Ref:        domain.NormalizeReadingRef(raw.ClientRef),
+		}
+		if reading.Technician == "" {
+			return nil, fmt.Errorf("%w: reading at index %d is missing a technician", domain.ErrInvalidInput, index)
+		}
+		if reading.Ref != "" {
+			if first, exists := refs[reading.Ref]; exists {
+				return nil, fmt.Errorf("%w: client_ref %q repeats (first used at index %d, again at index %d)", domain.ErrInvalidInput, reading.Ref, first, index)
+			}
+			refs[reading.Ref] = index
+		}
+		readings[index] = reading
+	}
+	return readings, nil
+}
+
+func readingInputError(index int, ref string, cause error) error {
+	detail := strings.TrimPrefix(cause.Error(), domain.ErrInvalidInput.Error()+": ")
+	location := fmt.Sprintf("index %d", index)
+	if ref != "" {
+		location = fmt.Sprintf("index %d (client_ref %q)", index, ref)
+	}
+	return fmt.Errorf("%w: reading at %s: %s", domain.ErrInvalidInput, location, detail)
+}
+
+func sameBatchPayload(got, want []domain.BatchReading) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range got {
+		if got[index].Observed != want[index].Observed ||
+			got[index].Technician != want[index].Technician ||
+			got[index].Ref != want[index].Ref {
+			return false
+		}
+	}
+	return true
+}
+
+func measurementEvent(eventID, caseID string, measurement domain.Measurement, at time.Time) (domain.AuditEvent, error) {
+	kind := "measurement_rejected"
+	detail := "measurement exceeded tolerance and requires another measurement"
+	if measurement.Accepted {
+		kind = "measurement_accepted"
+		detail = "measurement is within tolerance and ready for review"
+	}
+	return domain.NewAuditEvent(
+		eventID,
+		"case",
+		caseID,
+		caseID,
+		kind,
+		measurement.Technician,
+		detail,
+		at,
+	)
+}
+
+func batchResponse(record domain.MeasurementBatchRecord, replayed bool) contracts.BatchMeasurementsResponse {
+	byID := make(map[string]domain.Measurement, len(record.View.Measurements))
+	for _, measurement := range record.View.Measurements {
+		byID[measurement.ID] = measurement
+	}
+	results := make([]contracts.MeasurementResultItem, len(record.Readings))
+	for index, reading := range record.Readings {
+		results[index] = contracts.MeasurementResultItem{
+			Index:       index,
+			ClientRef:   reading.Ref,
+			Measurement: byID[record.MeasurementIDs[index]],
+		}
+	}
+	response := contracts.BatchMeasurementsResponse{
+		BatchID:      record.ID,
+		Replayed:     replayed,
+		Results:      results,
+		Case:         record.View.Case,
+		Measurements: copyMeasurements(record.View.Measurements),
+		Events:       copyEvents(record.View.Events),
+	}
+	return response
+}
+
+func copyMeasurements(values []domain.Measurement) []domain.Measurement {
+	result := make([]domain.Measurement, len(values))
+	copy(result, values)
+	return result
+}
+
+func copyEvents(values []domain.AuditEvent) []domain.AuditEvent {
+	result := make([]domain.AuditEvent, len(values))
+	copy(result, values)
+	return result
 }
 
 func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts.ReopenCaseRequest) (contracts.CaseResponse, error) {

@@ -13,6 +13,7 @@ type Repository struct {
 	devices      map[string]domain.Device
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
+	batches      map[string]map[string]domain.MeasurementBatchRecord
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
 	counters     map[string]int
@@ -23,6 +24,7 @@ func New() *Repository {
 		devices:      make(map[string]domain.Device),
 		cases:        make(map[string]domain.VerificationCase),
 		measurements: make(map[string][]domain.Measurement),
+		batches:      make(map[string]map[string]domain.MeasurementBatchRecord),
 		seals:        make(map[string]domain.EvidenceSeal),
 		counters:     make(map[string]int),
 	}
@@ -32,6 +34,7 @@ type Snapshot struct {
 	devices      map[string]domain.Device
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
+	batches      map[string]map[string]domain.MeasurementBatchRecord
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
 }
@@ -56,7 +59,17 @@ func (s Snapshot) Case(id string) (domain.VerificationCase, bool) {
 }
 
 func (s Snapshot) Measurements(caseID string) []domain.Measurement {
-	return append([]domain.Measurement(nil), s.measurements[caseID]...)
+	values := s.measurements[caseID]
+	result := make([]domain.Measurement, len(values))
+	copy(result, values)
+	return result
+}
+
+// MeasurementBatch returns a previously committed batch for the case keyed by
+// its caller-supplied batch id, supporting idempotent retries.
+func (s Snapshot) MeasurementBatch(caseID, batchID string) (domain.MeasurementBatchRecord, bool) {
+	item, ok := s.batches[caseID][batchID]
+	return item, ok
 }
 
 func (s Snapshot) Seal(caseID string) (domain.EvidenceSeal, bool) {
@@ -65,7 +78,7 @@ func (s Snapshot) Seal(caseID string) (domain.EvidenceSeal, bool) {
 }
 
 func (s Snapshot) Events(caseID string) []domain.AuditEvent {
-	var result []domain.AuditEvent
+	result := make([]domain.AuditEvent, 0)
 	for _, item := range s.events {
 		if item.CaseID == caseID {
 			result = append(result, item)
@@ -94,6 +107,7 @@ type Mutation struct {
 	devices      map[string]domain.Device
 	cases        map[string]domain.VerificationCase
 	measurements map[string][]domain.Measurement
+	batches      map[string]map[string]domain.MeasurementBatchRecord
 	seals        map[string]domain.EvidenceSeal
 	events       []domain.AuditEvent
 	counters     map[string]int
@@ -173,7 +187,34 @@ func (m *Mutation) AppendMeasurement(item domain.Measurement) error {
 }
 
 func (m *Mutation) Measurements(caseID string) []domain.Measurement {
-	return append([]domain.Measurement(nil), m.measurements[caseID]...)
+	values := m.measurements[caseID]
+	result := make([]domain.Measurement, len(values))
+	copy(result, values)
+	return result
+}
+
+// MeasurementBatch looks up a committed batch by its caller-supplied batch id.
+func (m *Mutation) MeasurementBatch(caseID, batchID string) (domain.MeasurementBatchRecord, bool) {
+	item, ok := m.batches[caseID][batchID]
+	return item, ok
+}
+
+// PutMeasurementBatch records a committed batch. A second batch id for the
+// same case is rejected so retries cannot silently replace the stored result.
+func (m *Mutation) PutMeasurementBatch(item domain.MeasurementBatchRecord) error {
+	if _, exists := m.cases[item.CaseID]; !exists {
+		return fmt.Errorf("%w: case %s", domain.ErrNotFound, item.CaseID)
+	}
+	byCase, exists := m.batches[item.CaseID]
+	if !exists {
+		byCase = make(map[string]domain.MeasurementBatchRecord)
+		m.batches[item.CaseID] = byCase
+	}
+	if _, exists := byCase[item.ID]; exists {
+		return fmt.Errorf("%w: batch %s for case %s", domain.ErrBatchReplayed, item.ID, item.CaseID)
+	}
+	byCase[item.ID] = item
+	return nil
 }
 
 func (m *Mutation) Seal(caseID string) (domain.EvidenceSeal, bool) {
@@ -194,7 +235,7 @@ func (m *Mutation) AppendEvent(item domain.AuditEvent) {
 }
 
 func (m *Mutation) Events(caseID string) []domain.AuditEvent {
-	var result []domain.AuditEvent
+	result := make([]domain.AuditEvent, 0)
 	for _, item := range m.events {
 		if item.CaseID == caseID {
 			result = append(result, item)
@@ -223,6 +264,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 		devices:      cloneDevices(r.devices),
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
+		batches:      cloneBatches(r.batches),
 		seals:        cloneSeals(r.seals),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 		counters:     cloneCounters(r.counters),
@@ -233,6 +275,7 @@ func (r *Repository) Mutate(ctx context.Context, fn func(*Mutation) error) error
 	r.devices = next.devices
 	r.cases = next.cases
 	r.measurements = next.measurements
+	r.batches = next.batches
 	r.seals = next.seals
 	r.events = next.events
 	r.counters = next.counters
@@ -244,6 +287,7 @@ func (r *Repository) snapshot() Snapshot {
 		devices:      cloneDevices(r.devices),
 		cases:        cloneCases(r.cases),
 		measurements: cloneMeasurements(r.measurements),
+		batches:      cloneBatches(r.batches),
 		seals:        cloneSeals(r.seals),
 		events:       append([]domain.AuditEvent(nil), r.events...),
 	}
@@ -269,6 +313,18 @@ func cloneMeasurements(values map[string][]domain.Measurement) map[string][]doma
 	result := make(map[string][]domain.Measurement, len(values))
 	for key, value := range values {
 		result[key] = append([]domain.Measurement(nil), value...)
+	}
+	return result
+}
+
+func cloneBatches(values map[string]map[string]domain.MeasurementBatchRecord) map[string]map[string]domain.MeasurementBatchRecord {
+	result := make(map[string]map[string]domain.MeasurementBatchRecord, len(values))
+	for caseID, byBatch := range values {
+		cloned := make(map[string]domain.MeasurementBatchRecord, len(byBatch))
+		for batchID, record := range byBatch {
+			cloned[batchID] = record
+		}
+		result[caseID] = cloned
 	}
 	return result
 }

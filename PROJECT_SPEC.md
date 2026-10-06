@@ -52,6 +52,30 @@ nominal value. An in-tolerance measurement moves the case to
 `review_ready`; an out-of-tolerance measurement moves it to
 `recheck_required`.
 
+### 3a. Record Measurement Batch
+
+A technician submits several readings gathered at one station in a single call
+to `POST /cases/{id}/measurements/batch`. Each reading carries the same fields
+as a single submission plus an optional `client_ref` correlation token. The
+caller supplies a case-scoped `batch_id` as an idempotency key.
+
+All readings are validated and computed before anything is written, and the
+whole batch lands in one repository commit:
+
+- Every accepted reading produces the same `Measurement` fact, deviation, and
+  acceptance decision it would produce through single submission.
+- Each reading gets a per-reading result located by its zero-based index and
+  echoed `client_ref`.
+- The case transitions exactly once: `review_ready` only when every reading is
+  in tolerance, otherwise `recheck_required`.
+- If any reading is illegal or the case is not awaiting measurement, the
+  request fails and no measurement, case change, or audit event is committed.
+- A retry carrying the same `batch_id` replays the stored result instead of
+  creating duplicate measurements, even after the case moved on or was sealed.
+  The same key with a different payload is rejected.
+- A `measurement_batch_recorded` audit event is appended alongside the
+  per-reading accept/reject events in the same commit.
+
 ### 4. Reopen Verification Case
 
 The steward sends `POST /cases/{id}/reopen` after an out-of-tolerance result.
@@ -90,6 +114,12 @@ Required invariants:
 - A sealed case cannot accept measurements, reopen, or seal again.
 - Every mutation that changes a case also appends an audit event in the same
   repository commit.
+- A measurement batch is all-or-nothing: an invalid or inapplicable reading
+  rejects the batch without changing the case, measurements, or audit events.
+- A batch transitions the case version exactly once and produces at least one
+  measurement per reading.
+- A `(case id, batch_id)` pair identifies at most one committed batch; retries
+  replay the stored result and never create duplicate measurements.
 
 ## Modules
 
@@ -110,6 +140,7 @@ Required invariants:
 - `POST /cases`
 - `GET /cases/{id}`
 - `POST /cases/{id}/measurements`
+- `POST /cases/{id}/measurements/batch`
 - `POST /cases/{id}/reopen`
 - `POST /cases/{id}/seal`
 - `GET /cases/{id}/events`
@@ -123,6 +154,8 @@ both success and failure behavior. The seal check also races two concurrent
 seal requests to prove that the repository mutation lock permits exactly one
 seal.
 
-Tests are intentionally deferred for this initialization baseline. The later
-engineering-task stage will add unit and integration tests, including red/green
-verification for the workflows and their failure paths.
+The batch smoke check and the Go test suite verify the all-or-nothing commit,
+per-reading locators and fact parity with single submission, idempotent
+replays (including after the case moved on or was sealed), divergent idempotency
+keys, and concurrent identical submissions that commit exactly once (the test
+suite runs under the race detector).
